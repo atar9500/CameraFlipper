@@ -3,4 +3,8 @@
 
     <!-- TODO: Remove or change this placeholder text -->
     <string name="hello_blank_fragment">Hello blank fragment</string>
+    <string name="permission_request">Permission Request</string>
+    <string name="permission_request_content">CameraFlipper will need access to your camera and storage in order to continue</string>
+    <string name="permission_request_content_denied">One of the necessary permissions are permanently denied, please head to settings to enable them</string>
+    <string name="image_saved">Image Saved!</string>
 </resources>

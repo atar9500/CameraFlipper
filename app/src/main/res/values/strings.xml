@@ -2,9 +2,12 @@
     <string name="app_name">CameraFlipper</string>
 
     <!-- TODO: Remove or change this placeholder text -->
-    <string name="hello_blank_fragment">Hello blank fragment</string>
+    <string name="allow_permissions_desc">Please allow permissions to proceed to camera</string>
     <string name="permission_request">Permission Request</string>
     <string name="permission_request_content">CameraFlipper will need access to your camera and storage in order to continue</string>
     <string name="permission_request_content_denied">One of the necessary permissions are permanently denied, please head to settings to enable them</string>
     <string name="image_saved">Image Saved!</string>
+    <string name="allow_permissions">Allow permissions</string>
+    <string name="setting">Settings</string>
+    <string name="no_photo_taken_yet">No photo has been taken yet!</string>
 </resources>

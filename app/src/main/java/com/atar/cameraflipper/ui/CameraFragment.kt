@@ -1,8 +1,6 @@
-package com.atar.cameraflipper
+package com.atar.cameraflipper.ui
 
-import android.Manifest
 import android.annotation.SuppressLint
-import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -14,23 +12,27 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.*
 import android.media.ImageReader
-import android.net.Uri
 import android.os.*
-import android.provider.Settings
 import android.util.Log
 import android.util.Size
-import android.util.SparseIntArray
 import android.view.*
 import androidx.fragment.app.Fragment
 import android.widget.Toast
 import androidx.core.content.ContextCompat
-import com.karumi.dexter.Dexter
-import com.karumi.dexter.MultiplePermissionsReport
-import com.karumi.dexter.PermissionToken
-import com.karumi.dexter.listener.PermissionRequest
-import com.karumi.dexter.listener.multi.MultiplePermissionsListener
+import androidx.core.content.FileProvider
+import androidx.lifecycle.ViewModelProviders
+import com.atar.cameraflipper.*
+import com.atar.cameraflipper.utils.AngleCalculationTask
+import com.atar.cameraflipper.utils.CompareSizesByArea
+import com.atar.cameraflipper.utils.Constants
+import com.atar.cameraflipper.utils.ImageSaver
+import com.bumptech.glide.Glide
+import com.bumptech.glide.load.engine.DiskCacheStrategy
+import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade
+import com.bumptech.glide.request.RequestOptions
+import com.bumptech.glide.request.transition.DrawableCrossFadeFactory
 import kotlinx.android.synthetic.main.fragment_camera.*
-import java.lang.ref.WeakReference
+import java.io.File
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -39,28 +41,6 @@ class CameraFragment : Fragment() {
 
     companion object {
         private const val TAG = "CameraFragment"
-        private val mAppPermissions = arrayOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.READ_EXTERNAL_STORAGE,
-            Manifest.permission.WRITE_EXTERNAL_STORAGE
-        )
-        private const val MAX_PREVIEW_WIDTH = 1920
-        private const val MAX_PREVIEW_HEIGHT = 1080
-
-        private const val STATE_PREVIEW = 0
-        private const val STATE_WAITING_LOCK = 1
-        private const val STATE_WAITING_PRECAPTURE = 2
-        private const val STATE_WAITING_NON_PRECAPTURE = 3
-        private const val STATE_PICTURE_TAKEN = 4
-
-        private val ORIENTATIONS = SparseIntArray()
-
-        init {
-            ORIENTATIONS.append(Surface.ROTATION_0, 90)
-            ORIENTATIONS.append(Surface.ROTATION_90, 0)
-            ORIENTATIONS.append(Surface.ROTATION_180, 270)
-            ORIENTATIONS.append(Surface.ROTATION_270, 180)
-        }
 
         @JvmStatic
         private fun chooseOptimalSize(
@@ -111,17 +91,11 @@ class CameraFragment : Fragment() {
     /**
      * Motion sensors related data
      */
+    private var mDegrees: Float = 0f
     private lateinit var mSensorManager: SensorManager
     private val mAccelerometerReading = FloatArray(3)
     private val mMagnetometerReading = FloatArray(3)
     private val mCameraOpenCloseLock = Semaphore(1)
-    private var mSensorOrientation: Int? = 0
-    private var mFlashSupported = false
-    private var mRequestingPermissions = false
-    private var mCameraDevice: CameraDevice? = null
-    private var mState = STATE_PREVIEW
-    private var mBackgroundThread: HandlerThread? = null
-    private var mIsSelfie = false
     private val mSensorEventListener = object : SensorEventListener {
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
@@ -147,7 +121,7 @@ class CameraFragment : Fragment() {
                 rotateCamera = true
             }
             if (rotateCamera) {
-                AngleCalculationTask(frca_cam).executeOnExecutor(
+                AngleCalculationTask(mCalculationListener).executeOnExecutor(
                     AsyncTask.SERIAL_EXECUTOR,
                     mAccelerometerReading,
                     mMagnetometerReading
@@ -155,10 +129,18 @@ class CameraFragment : Fragment() {
             }
         }
     }
+    private var mCalculationListener = object :
+        AngleCalculationTask.CalculationListener {
+        override fun onCalculationEnd(result: Float) {
+            mDegrees = result
+        }
+    }
 
     /**
      * Camera related data
      */
+    private lateinit var mFile: File
+    private lateinit var mViewModel: HomeViewModel
     private var mBackgroundHandler: Handler? = null
     private lateinit var mPreviewSize: Size
     private var mImageReader: ImageReader? = null
@@ -166,8 +148,21 @@ class CameraFragment : Fragment() {
     private var mCaptureSession: CameraCaptureSession? = null
     private lateinit var mPreviewRequestBuilder: CaptureRequest.Builder
     private lateinit var mPreviewRequest: CaptureRequest
-    private val onImageAvailableListener = ImageReader.OnImageAvailableListener {
-        mBackgroundHandler?.post(ImageSaver(it.acquireNextImage()))
+    private var mSensorOrientation: Int? = 0
+    private var mFlashSupported = false
+    private var mCameraDevice: CameraDevice? = null
+    private var mState = Constants.STATE_PREVIEW
+    private var mBackgroundThread: HandlerThread? = null
+    private var mIsFront = false
+    private val mOnImageAvailableListener = ImageReader.OnImageAvailableListener {
+        mBackgroundHandler?.post(ImageSaver(it.acquireNextImage(), mFile, mImageSavedListener))
+    }
+    private val mImageSavedListener = object : ImageSaver.ImageSavedListener {
+        override fun onImageSaved() {
+            activity?.runOnUiThread {
+                updateSavedThumbnail()
+            }
+        }
     }
     private val mSurfaceTextureListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
@@ -175,47 +170,14 @@ class CameraFragment : Fragment() {
         }
 
         override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
-            configureTransform(width, height)
+            configureTransform(width, height, mDegrees)
         }
 
         override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean = true
 
-        override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
-
-    }
-    private val mPermissionsListener = object : MultiplePermissionsListener {
-        override fun onPermissionsChecked(report: MultiplePermissionsReport) {
-            when {
-                report.isAnyPermissionPermanentlyDenied -> {
-                    AlertDialog.Builder(context!!)
-                        .setTitle(R.string.permission_request)
-                        .setMessage(R.string.permission_request_content_denied)
-                        .setPositiveButton(android.R.string.ok) { _, _ ->
-                            val intent = Intent()
-                            intent.action = Settings.ACTION_APPLICATION_DETAILS_SETTINGS
-                            val uri = Uri.fromParts("package", activity!!.packageName, null)
-                            intent.data = uri
-                            startActivity(intent)
-                        }.setNegativeButton(android.R.string.cancel) { _, _ -> }.show()
-                }
-                else -> {
-                    openCamera()
-                }
-            }
-        }
-
-        override fun onPermissionRationaleShouldBeShown(
-            permissions: MutableList<PermissionRequest>?,
-            token: PermissionToken?
-        ) {
-            AlertDialog.Builder(context!!)
-                .setTitle(R.string.permission_request)
-                .setMessage(R.string.permission_request_content)
-                .setPositiveButton(android.R.string.ok) { _, _ ->
-                    token?.continuePermissionRequest()
-                }.setNegativeButton(android.R.string.cancel) { _, _ ->
-                    token?.cancelPermissionRequest()
-                }.show()
+        override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
+            Log.i(TAG, "Frame")
+            configureTransform(frca_cam.width, frca_cam.height, mDegrees)
         }
 
     }
@@ -223,23 +185,23 @@ class CameraFragment : Fragment() {
 
         private fun process(result: CaptureResult) {
             when (mState) {
-                STATE_PREVIEW -> Unit // Do nothing when the camera preview is working normally.
-                STATE_WAITING_LOCK -> capturePicture(result)
-                STATE_WAITING_PRECAPTURE -> {
+                Constants.STATE_PREVIEW -> Unit // Do nothing when the camera preview is working normally.
+                Constants.STATE_WAITING_LOCK -> capturePicture(result)
+                Constants.STATE_WAITING_PRECAPTURE -> {
                     // CONTROL_AE_STATE can be null on some devices
                     val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
                     if (aeState == null ||
                         aeState == CaptureResult.CONTROL_AE_STATE_PRECAPTURE ||
                         aeState == CaptureRequest.CONTROL_AE_STATE_FLASH_REQUIRED
                     ) {
-                        mState = STATE_WAITING_NON_PRECAPTURE
+                        mState = Constants.STATE_WAITING_NON_PRECAPTURE
                     }
                 }
-                STATE_WAITING_NON_PRECAPTURE -> {
+                Constants.STATE_WAITING_NON_PRECAPTURE -> {
                     // CONTROL_AE_STATE can be null on some devices
                     val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
                     if (aeState == null || aeState != CaptureResult.CONTROL_AE_STATE_PRECAPTURE) {
-                        mState = STATE_PICTURE_TAKEN
+                        mState = Constants.STATE_PICTURE_TAKEN
                         captureStillPicture()
                     }
                 }
@@ -247,19 +209,20 @@ class CameraFragment : Fragment() {
         }
 
         private fun capturePicture(result: CaptureResult) {
-            val afState = result.get(CaptureResult.CONTROL_AF_STATE)
-            if (afState == null) {
-                captureStillPicture()
-            } else if (afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
-                || afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
-            ) {
-                // CONTROL_AE_STATE can be null on some devices
-                val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
-                if (aeState == null || aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
-                    mState = STATE_PICTURE_TAKEN
+            when (result.get(CaptureResult.CONTROL_AF_STATE)) {
+                null -> {
                     captureStillPicture()
-                } else {
-                    runPrecaptureSequence()
+                }
+                CaptureResult.CONTROL_AF_STATE_INACTIVE,
+                CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED,
+                CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED -> {
+                    val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                    if (aeState == null || aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
+                        mState = Constants.STATE_PICTURE_TAKEN
+                        captureStillPicture()
+                    } else {
+                        runPrecaptureSequence()
+                    }
                 }
             }
         }
@@ -282,35 +245,6 @@ class CameraFragment : Fragment() {
     }
 
     /**
-     * Inner Classes
-     */
-    private class AngleCalculationTask internal constructor(viewToFlip: View) :
-        AsyncTask<FloatArray, Void, Float>() {
-
-        private val mFlippedViewRef: WeakReference<View> = WeakReference(viewToFlip)
-
-        override fun doInBackground(vararg params: FloatArray?): Float {
-            val rotationMatrix = FloatArray(9)
-            val orientationAngles = FloatArray(3)
-            SensorManager.getRotationMatrix(
-                rotationMatrix,
-                null,
-                params[0],
-                params[1]
-            )
-            SensorManager.getOrientation(rotationMatrix, orientationAngles)
-            return -(orientationAngles[2] * (180 / Math.PI)).toFloat()
-        }
-
-        override fun onPostExecute(result: Float) {
-            val flippedView = mFlippedViewRef.get()
-            if (flippedView != null) {
-                flippedView.rotation = result
-            }
-        }
-    }
-
-    /**
      * Fragment Methods
      */
     override fun onCreateView(
@@ -318,6 +252,13 @@ class CameraFragment : Fragment() {
         savedInstanceState: Bundle?
     ): View? {
         return inflater.inflate(R.layout.fragment_camera, container, false)
+    }
+
+    override fun onActivityCreated(savedInstanceState: Bundle?) {
+        super.onActivityCreated(savedInstanceState)
+        mViewModel = ViewModelProviders.of(activity!!).get(HomeViewModel::class.java)
+        val dirPath = activity?.getExternalFilesDir(Environment.getExternalStorageState())
+        mFile = File(dirPath, Constants.PIC_FILE_NAME)
     }
 
     override fun onResume() {
@@ -349,15 +290,34 @@ class CameraFragment : Fragment() {
         }
 
         frca_switch.setOnClickListener {
-            mIsSelfie = !mIsSelfie
+            mIsFront = !mIsFront
             closeCamera()
             openCamera()
         }
-
-        if (!mRequestingPermissions) {
-            reopenCamera()
+        frca_gallery.setOnClickListener {
+            if (mFile.exists()) {
+                val intent = Intent()
+                intent.action = Intent.ACTION_VIEW
+                val fileUri = FileProvider.getUriForFile(
+                    activity!!,
+                    Constants.FILE_PROVIDER_AUTH,
+                    mFile
+                )
+                intent.setDataAndType(fileUri, "image/*")
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                startActivity(intent)
+            } else {
+                Toast.makeText(context!!, R.string.no_photo_taken_yet, Toast.LENGTH_LONG).show()
+            }
         }
-        mRequestingPermissions = false
+
+        if (mFile.exists()) {
+            updateSavedThumbnail()
+        } else {
+            frca_gallery.isEnabled = false
+        }
+
+        reopenCamera()
     }
 
     override fun onPause() {
@@ -382,10 +342,11 @@ class CameraFragment : Fragment() {
     @SuppressLint("MissingPermission")
     private fun openCamera() {
         if (!checkCameraPermissions()) {
+            mViewModel.setPermissionsGranted(false)
             return
         }
         setUpCameraOutputs(frca_cam.width, frca_cam.height)
-        configureTransform(frca_cam.width, frca_cam.height)
+        configureTransform(frca_cam.width, frca_cam.height, mDegrees)
         val manager = activity?.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         try {
             // Wait for camera to open - 2.5 seconds is sufficient
@@ -407,7 +368,7 @@ class CameraFragment : Fragment() {
      */
     private fun checkCameraPermissions(): Boolean {
         val permissions = mutableListOf<String>()
-        mAppPermissions.forEach {
+        Constants.APP_PERMISSIONS.forEach {
             val permissionStatus = ContextCompat.checkSelfPermission(activity!!, it)
             if (permissionStatus != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(it)
@@ -416,9 +377,6 @@ class CameraFragment : Fragment() {
         if (permissions.isEmpty()) {
             return true
         }
-        mRequestingPermissions = true
-        Dexter.withActivity(activity)
-            .withPermissions(permissions).withListener(mPermissionsListener).check()
         return false
     }
 
@@ -430,13 +388,12 @@ class CameraFragment : Fragment() {
 
                 // We don't use a front facing camera in this sample.
                 val cameraDirection = characteristics.get(CameraCharacteristics.LENS_FACING)
+                val isFrontId = cameraDirection == CameraCharacteristics.LENS_FACING_FRONT
                 if (cameraDirection == null) {
                     continue
-                } else if (!mIsSelfie
-                    && cameraDirection == CameraCharacteristics.LENS_FACING_FRONT) {
+                } else if (!mIsFront && isFrontId) {
                     continue
-                } else if (mIsSelfie
-                    && cameraDirection != CameraCharacteristics.LENS_FACING_FRONT) {
+                } else if (mIsFront && !isFrontId) {
                     continue
                 }
 
@@ -453,7 +410,7 @@ class CameraFragment : Fragment() {
                     largest.width, largest.height, ImageFormat.JPEG, 2
                 ).apply {
                     setOnImageAvailableListener(
-                        onImageAvailableListener,
+                        mOnImageAvailableListener,
                         mBackgroundHandler
                     )
                 }
@@ -461,33 +418,20 @@ class CameraFragment : Fragment() {
                 // Find out if we need to swap dimension to get the preview size relative to sensor
                 // coordinate.
                 val defaultDisplay = activity?.windowManager?.defaultDisplay
-                val displayRotation = defaultDisplay?.rotation
 
                 mSensorOrientation =
                     characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)
-                val swappedDimensions = areDimensionsSwapped(displayRotation!!)
 
                 val displaySize = Point()
-                defaultDisplay.getSize(displaySize)
-                val rotatedPreviewWidth = if (swappedDimensions) height else width
-                val rotatedPreviewHeight = if (swappedDimensions) width else height
-                var maxPreviewWidth =
-                    if (swappedDimensions) displaySize.y else displaySize.x
-                var maxPreviewHeight =
-                    if (swappedDimensions) displaySize.x else displaySize.y
-
-                if (maxPreviewWidth > MAX_PREVIEW_HEIGHT) maxPreviewWidth =
-                    MAX_PREVIEW_HEIGHT
-                if (maxPreviewHeight > MAX_PREVIEW_WIDTH) maxPreviewHeight =
-                    MAX_PREVIEW_WIDTH
+                defaultDisplay?.getSize(displaySize)
 
                 // Danger, W.R.! Attempting to use too large a preview size could  exceed the camera
                 // bus' bandwidth limitation, resulting in gorgeous previews but the storage of
                 // garbage capture data.
                 mPreviewSize = chooseOptimalSize(
                     map.getOutputSizes(SurfaceTexture::class.java),
-                    rotatedPreviewWidth, rotatedPreviewHeight,
-                    maxPreviewWidth, maxPreviewHeight,
+                    width, height,
+                    displaySize.x, displaySize.y,
                     largest
                 )
 
@@ -525,55 +469,14 @@ class CameraFragment : Fragment() {
      * @param viewWidth  The width of `textureView`
      * @param viewHeight The height of `textureView`
      */
-    private fun configureTransform(viewWidth: Int, viewHeight: Int) {
-        val rotation = activity?.windowManager?.defaultDisplay?.rotation
+    @Synchronized
+    private fun configureTransform(viewWidth: Int, viewHeight: Int, degrees: Float) {
         val matrix = Matrix()
         val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
-        val bufferRect =
-            RectF(0f, 0f, mPreviewSize.height.toFloat(), mPreviewSize.width.toFloat())
         val centerX = viewRect.centerX()
         val centerY = viewRect.centerY()
-
-        if (Surface.ROTATION_90 == rotation || Surface.ROTATION_270 == rotation) {
-            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
-            val scale =
-                (viewHeight.toFloat() / mPreviewSize.height).coerceAtLeast(viewWidth.toFloat() / mPreviewSize.width)
-            with(matrix) {
-                setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-                postScale(scale, scale, centerX, centerY)
-                postRotate((90 * (rotation - 2)).toFloat(), centerX, centerY)
-            }
-        } else if (Surface.ROTATION_180 == rotation) {
-            matrix.postRotate(180f, centerX, centerY)
-        }
+        matrix.postRotate(degrees, centerX, centerY)
         frca_cam.setTransform(matrix)
-    }
-
-    /**
-     * Determines if the dimensions are swapped given the phone's current rotation.
-     *
-     * @param displayRotation The current rotation of the display
-     *
-     * @return true if the dimensions are swapped, false otherwise.
-     */
-    private fun areDimensionsSwapped(displayRotation: Int): Boolean {
-        var swappedDimensions = false
-        when (displayRotation) {
-            Surface.ROTATION_0, Surface.ROTATION_180 -> {
-                if (mSensorOrientation == 90 || mSensorOrientation == 270) {
-                    swappedDimensions = true
-                }
-            }
-            Surface.ROTATION_90, Surface.ROTATION_270 -> {
-                if (mSensorOrientation == 0 || mSensorOrientation == 180) {
-                    swappedDimensions = true
-                }
-            }
-            else -> {
-                Log.e(TAG, "Display rotation is invalid: $displayRotation")
-            }
-        }
-        return swappedDimensions
     }
 
     private fun setAutoFlash(requestBuilder: CaptureRequest.Builder) {
@@ -692,7 +595,7 @@ class CameraFragment : Fragment() {
                 // For devices with orientation of 270, we need to rotate the JPEG 180 degrees.
                 set(
                     CaptureRequest.JPEG_ORIENTATION,
-                    (ORIENTATIONS.get(rotation) + mSensorOrientation!! + 270) % 360
+                    (Constants.ORIENTATIONS.get(rotation) + mSensorOrientation!! + 270) % 360
                 )
 
                 // Use the same AE and AF modes as the preview.
@@ -724,6 +627,19 @@ class CameraFragment : Fragment() {
         }
     }
 
+    private fun updateSavedThumbnail() {
+        val factory = DrawableCrossFadeFactory.Builder().setCrossFadeEnabled(true).build()
+        Glide.with(this@CameraFragment)
+            .load(mFile)
+            .transition(withCrossFade(factory))
+            .diskCacheStrategy(DiskCacheStrategy.NONE)
+            .skipMemoryCache(true)
+            .centerCrop()
+            .apply(RequestOptions.circleCropTransform())
+            .into(frca_gallery)
+        frca_capture.isEnabled = true
+    }
+
     /**
      * Unlock the focus. This method should be called when still image capture sequence is
      * finished.
@@ -741,7 +657,7 @@ class CameraFragment : Fragment() {
                 mBackgroundHandler
             )
             // After this, the camera will go back to the normal state of preview.
-            mState = STATE_PREVIEW
+            mState = Constants.STATE_PREVIEW
             mCaptureSession?.setRepeatingRequest(
                 mPreviewRequest, mCaptureCallback,
                 mBackgroundHandler
@@ -764,7 +680,7 @@ class CameraFragment : Fragment() {
                 CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START
             )
             // Tell #mCaptureCallback to wait for the precapture sequence to be set.
-            mState = STATE_WAITING_PRECAPTURE
+            mState = Constants.STATE_WAITING_PRECAPTURE
             mCaptureSession?.capture(
                 mPreviewRequestBuilder.build(), mCaptureCallback,
                 mBackgroundHandler
@@ -827,7 +743,7 @@ class CameraFragment : Fragment() {
                 CameraMetadata.CONTROL_AF_TRIGGER_START
             )
             // Tell #captureCallback to wait for the lock.
-            mState = STATE_WAITING_LOCK
+            mState = Constants.STATE_WAITING_LOCK
             mCaptureSession?.capture(
                 mPreviewRequestBuilder.build(), mCaptureCallback,
                 mBackgroundHandler

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package com.atar.cameraflipper
+package com.atar.cameraflipper.ui
 
 import android.content.Context
 import android.util.AttributeSet

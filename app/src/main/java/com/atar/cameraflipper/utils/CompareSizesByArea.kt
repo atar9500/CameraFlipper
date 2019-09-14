@@ -1,4 +1,4 @@
-package com.atar.cameraflipper
+package com.atar.cameraflipper.utils
 
 import android.util.Size
 import java.lang.Long.signum

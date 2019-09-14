@@ -1,26 +1,29 @@
-package com.atar.cameraflipper
+package com.atar.cameraflipper.utils
 
 import android.media.Image
-import android.os.Environment
 import android.util.Log
 
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.lang.ref.WeakReference
 
 internal class ImageSaver(
-    private val mImage: Image
+    private val mImage: Image,
+    private val mFile: File,
+    imageSavedListener: ImageSavedListener
 ) : Runnable {
 
+    private val mImageSavedListener: WeakReference<ImageSavedListener> =
+        WeakReference(imageSavedListener)
+
     override fun run() {
-        val file = File(FILE_PIC_DIR, PIC_FILE_NAME)
-        file.parentFile.mkdir()
         val buffer = mImage.planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
         var output: FileOutputStream? = null
         try {
-            output = FileOutputStream(file).apply {
+            output = FileOutputStream(mFile).apply {
                 write(bytes)
             }
         } catch (e: IOException) {
@@ -30,6 +33,7 @@ internal class ImageSaver(
             output?.let {
                 try {
                     it.close()
+                    mImageSavedListener.get()?.onImageSaved()
                 } catch (e: IOException) {
                     Log.e(TAG, e.toString())
                 }
@@ -37,9 +41,11 @@ internal class ImageSaver(
         }
     }
 
+    interface ImageSavedListener {
+        fun onImageSaved()
+    }
+
     companion object {
         private const val TAG = "ImageSaver"
-        private val FILE_PIC_DIR = "${Environment.getExternalStorageDirectory()}${File.separator}CameraFilpper"
-        private const val PIC_FILE_NAME = "camera_flipper_demo_pic.jpg"
     }
 }
